@@ -1,3 +1,5 @@
+"use client";
+
 // src/app/(app)/rigs/[rigId]/page.tsx
 import { PageHeader } from '@/components/shared/page-header';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';

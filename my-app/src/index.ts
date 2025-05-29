@@ -187,18 +187,102 @@ async function triggerNiceHashPayout(apiKey: string, apiSecret: string, orgId: s
   return true;
 }
 
-// Helper: Get user's Telegram chat ID and alert settings from KV
-async function getUserAlertSettings(env: Env, uid: string) {
-  const alertEnabled = await env.RIGS_KV.get(`alert_enabled:${uid}`);
-  const chatId = await env.RIGS_KV.get(`telegram_chat_id:${uid}`);
+// Helper: Trigger payout via NowPayments API (real implementation)
+async function triggerNowPaymentsPayout(apiKey: string, payoutAddress: string, amount: number) {
+  const url = 'https://api.nowpayments.io/v1/payout';
+  const body = {
+    address: payoutAddress,
+    amount: amount.toString(),
+    currency: 'BTC',
+  };
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`NowPayments payout failed: ${err}`);
+  }
+  const data = await resp.json();
+  if (data && typeof data === 'object' && 'payout_id' in data) {
+    return true;
+  }
+  throw new Error('NowPayments payout: unexpected response');
+}
+
+// Helper: Trigger payout via Coinbase API (real implementation)
+async function triggerCoinbasePayout(apiKey: string, payoutAddress: string, amount: number) {
+  const url = 'https://api.coinbase.com/v2/accounts/primary/transactions';
+  const body = {
+    type: 'send',
+    to: payoutAddress,
+    amount: amount.toString(),
+    currency: 'BTC',
+    description: 'Mining payout',
+  };
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const err = await resp.text();
+    throw new Error(`Coinbase payout failed: ${err}`);
+  }
+  const data = await resp.json();
+  if (data && (data as any).data && (data as any).data.id) {
+    return true;
+  }
+  throw new Error('Coinbase payout: unexpected response');
+}
+
+// Helper: Get payout provider and API key from Firestore
+async function getUserPayoutSettingsFromFirestore(uid: string) {
+  const fs = getAdminFirestore();
+  const doc = await fs.collection('users').doc(uid).collection('settings').doc('payout').get();
+  const data = doc.exists ? doc.data() : {};
   return {
-    enabled: alertEnabled !== 'false', // default to true if not set
-    chatId: chatId || TELEGRAM_CHAT_ID,
+    provider: data?.provider || 'nowpayments', // 'nowpayments' or 'coinbase'
+    apiKey: data?.apiKey || '',
+    payoutAddress: data?.payoutAddress || '',
   };
 }
 
-async function sendUserTelegramAlert(env: Env, uid: string, message: string) {
-  const settings = await getUserAlertSettings(env, uid);
+// --- Firestore Admin Setup for Worker ---
+import { initializeApp, applicationDefault } from 'firebase-admin/app';
+import { getFirestore } from 'firebase-admin/firestore';
+
+let firestore: FirebaseFirestore.Firestore | null = null;
+function getAdminFirestore() {
+  if (!firestore) {
+    initializeApp({ credential: applicationDefault() });
+    firestore = getFirestore();
+  }
+  return firestore;
+}
+
+// Helper: Get alert settings from Firestore for a user
+async function getUserAlertSettingsFromFirestore(uid: string) {
+  const fs = getAdminFirestore();
+  const doc = await fs.collection('users').doc(uid).collection('settings').doc('alerts').get();
+  const data = doc.exists ? doc.data() : {};
+  return {
+    enabled: data?.enabled !== false, // default true
+    chatId: data?.telegramChatId || TELEGRAM_CHAT_ID,
+  };
+}
+
+async function sendUserTelegramAlertWithFirestore(uid: string, message: string) {
+  const settings = await getUserAlertSettingsFromFirestore(uid);
   if (!settings.enabled) return;
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   await fetch(url, {
@@ -206,6 +290,17 @@ async function sendUserTelegramAlert(env: Env, uid: string, message: string) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: settings.chatId, text: message })
   });
+}
+
+// Ethermine API: Fetch rig stats by wallet address
+async function fetchEthermineRigStats(wallet: string) {
+  // Ethermine API docs: https://ethermine.org/api/doc
+  const url = `https://api.ethermine.org/miner/${wallet}/currentStats`;
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('Failed to fetch Ethermine data');
+  const data = await resp.json() as any;
+  if (data.status !== 'OK') throw new Error('Ethermine API error: ' + data.message);
+  return data.data;
 }
 
 export default {
@@ -245,8 +340,9 @@ export default {
   // The scheduled handler is invoked at the interval set in our wrangler.jsonc's
   // [[triggers]] configuration.
   async scheduled(event, env, ctx) {
-    // Example: For each user, fetch NiceHash data and store in KV
+    // Only declare userList once
     const userList = await env.RIGS_KV.list();
+    // Example: For each user, fetch NiceHash data and store in KV
     for (const key of userList.keys) {
       const uid = key.name;
       // In production, fetch user's NiceHash API key/secret from KV or user settings
@@ -260,8 +356,7 @@ export default {
       }
     }
     // Update: For each user, fetch HiveOS token and farm ID from KV and update rig data
-    const userList2 = await env.RIGS_KV.list();
-    for (const key of userList2.keys) {
+    for (const key of userList.keys) {
       const uid = key.name;
       const hiveToken = await env.RIGS_KV.get(`hiveos_token:${uid}`);
       const farmId = await env.RIGS_KV.get(`hiveos_farmid:${uid}`);
@@ -274,42 +369,29 @@ export default {
         }
       }
     }
-    // Scan all user keys in KV (for demo, assume keys are user IDs)
-    // In production, you may want to keep a list of user IDs in a separate key
-    const list = await env.RIGS_KV.list();
-    for (const key of list.keys) {
+    // Alert logic: Telegram alert if rig offline > 10 min, using Firestore settings
+    for (const key of userList.keys) {
       const uid = key.name;
       const data = await env.RIGS_KV.get(uid, "json");
       if (!data || !Array.isArray(data)) continue;
       for (const rig of data) {
-        // Assume rig.status and rig.lastSeen (ISO string or timestamp)
         if (rig.status === "offline" && rig.lastSeen) {
           const lastSeen = new Date(rig.lastSeen).getTime();
           const now = Date.now();
           if (now - lastSeen > 10 * 60 * 1000) { // 10 minutes
-            await sendUserTelegramAlert(env, uid, `ALERT: Rig ${rig.name} (user ${uid}) has been offline for more than 10 minutes!`);
+            await sendUserTelegramAlertWithFirestore(uid, `ALERT: Rig ${rig.name} (user ${uid}) has been offline for more than 10 minutes!`);
           }
         }
       }
     }
-    // A Cron Trigger can make requests to other endpoints on the Internet,
-    // publish to a Queue, query a D1 Database, and much more.
-    //
-    // We'll keep it simple and make an API call to a Cloudflare API:
-    let resp = await fetch('https://api.cloudflare.com/client/v4/ips');
-    let wasSuccessful = resp.ok ? 'success' : 'fail';
-
-    // You could store this result in KV, write to a D1 Database, or publish to a Queue.
-    // In this template, we'll just log the result:
-    console.log(`trigger fired at ${event.cron}: ${wasSuccessful}`);
-
     // Auto payout logic
-    const userList3 = await env.RIGS_KV.list();
-    for (const key of userList3.keys) {
+    for (const key of userList.keys) {
       const uid = key.name;
       // Fetch payout threshold and withdrawal address for user
       const thresholdStr = await env.RIGS_KV.get(`payout_threshold:${uid}`);
-      const withdrawalAddress = await env.RIGS_KV.get(`withdrawal_address:${uid}`);
+      // Get payout provider, API key, and address from Firestore
+      const payoutSettings = await getUserPayoutSettingsFromFirestore(uid);
+      const withdrawalAddress = payoutSettings.payoutAddress;
       if (!thresholdStr || !withdrawalAddress) continue;
       const threshold = parseFloat(thresholdStr);
       // Fetch user's NiceHash API key/secret/orgId (replace with per-user storage in production)
@@ -319,10 +401,26 @@ export default {
       try {
         const earnings = await fetchNiceHashEarnings(apiKey, apiSecret, orgId);
         if (earnings >= threshold) {
-          // Trigger payout
-          const payoutResult = await triggerNiceHashPayout(apiKey, apiSecret, orgId, withdrawalAddress, earnings);
+          // Trigger payout via selected provider
+          let payoutResult = false;
+          if (payoutSettings.provider === 'coinbase') {
+            payoutResult = await triggerCoinbasePayout(payoutSettings.apiKey, withdrawalAddress, earnings);
+          } else {
+            payoutResult = await triggerNowPaymentsPayout(payoutSettings.apiKey, withdrawalAddress, earnings);
+          }
           if (payoutResult) {
-            await sendUserTelegramAlert(env, uid, `Auto payout triggered for user ${uid}: ${earnings} BTC sent to ${withdrawalAddress}`);
+            // Add payout history to Firestore
+            const fs = getAdminFirestore();
+            const payoutId = `${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+            await fs.collection('users').doc(uid).collection('payouts').doc(payoutId).set({
+              timestamp: Date.now(),
+              amount: earnings,
+              address: withdrawalAddress,
+              provider: payoutSettings.provider,
+              status: 'success',
+              tx: payoutResult,
+            });
+            await sendUserTelegramAlertWithFirestore(uid, `Auto payout triggered for user ${uid}: ${earnings} BTC sent to ${withdrawalAddress} via ${payoutSettings.provider}`);
           }
         }
       } catch (e) {
@@ -332,8 +430,144 @@ export default {
         } else if (typeof e === 'string') {
           msg = e;
         }
-        await sendUserTelegramAlert(env, uid, `Auto payout error for user ${uid}: ${msg}`);
+        await sendUserTelegramAlertWithFirestore(uid, `Auto payout error for user ${uid}: ${msg}`);
+      }
+    }
+    // Firestore sync logic
+    for (const key of userList.keys) {
+      const uid = key.name;
+      // Fetch tokens/IDs from KV
+      const hiveToken = await env.RIGS_KV.get(`hiveos_token:${uid}`);
+      const farmId = await env.RIGS_KV.get(`hiveos_farmid:${uid}`);
+      const nicehashApiKey = env.NICEHASH_KEY;
+      const nicehashApiSecret = env.NICEHASH_SECRET;
+      const ethermineWallet = await env.RIGS_KV.get(`ethermine_wallet:${uid}`);
+      let allRigs: any[] = [];
+      // HiveOS
+      if (hiveToken && farmId) {
+        try {
+          const hiveRigs = await fetchHiveOSRigDataWithFarmId(hiveToken, farmId);
+          allRigs = allRigs.concat(hiveRigs);
+        } catch {}
+      }
+      // NiceHash
+      try {
+        const nicehashRigs = await fetchNiceHashRigData(uid, nicehashApiKey, nicehashApiSecret);
+        allRigs = allRigs.concat(nicehashRigs);
+      } catch {}
+      // Ethermine
+      if (ethermineWallet) {
+        try {
+          const ethermineStats = await fetchEthermineRigStats(ethermineWallet) as any;
+          if (Array.isArray(ethermineStats.workers)) {
+            allRigs = allRigs.concat((ethermineStats.workers as any[]).map((w: any) => ({
+              id: w.worker,
+              name: w.worker,
+              hashrate: w.currentHashrate,
+              status: w.currentHashrate > 0 ? 'online' : 'offline',
+            })));
+          }
+        } catch {}
+      }
+      // Save to Firestore: /users/{uid}/rigs/{rigId}
+      const fs = await getFirestore();
+      for (const rig of allRigs) {
+        if (!rig.id) continue;
+        await fs.collection('users').doc(uid).collection('rigs').doc(rig.id).set(rig, { merge: true });
+      }
+    }
+    // Fetch rig live stats based on platform
+    const fs = await getFirestore();
+    for (const key of userList.keys) {
+      const uid = key.name;
+      // Fetch all rigs for this user from Firestore
+      const rigDocs = await fs.collection('users').doc(uid).collection('rigs').get();
+      for (const rigDoc of rigDocs.docs) {
+        const rig = rigDoc.data();
+        let liveStats = {};
+        try {
+          if (rig.platform === 'NiceHash' && rig.nicehashApiKey && rig.nicehashApiSecret && rig.nicehashOrgId) {
+            const stats = await fetchNiceHashRigData(uid, rig.nicehashApiKey, rig.nicehashApiSecret);
+            liveStats = stats[0] || {};
+          } else if (rig.platform === 'HiveOS' && rig.hiveosToken && rig.hiveosFarmId) {
+            const stats = await fetchHiveOSRigDataWithFarmId(rig.hiveosToken, rig.hiveosFarmId);
+            liveStats = stats[0] || {};
+          } else if (rig.platform === 'Ethermine' && rig.ethermineWallet) {
+            const stats = await fetchEthermineRigStats(rig.ethermineWallet);
+            liveStats = stats || {};
+          } else if (rig.platform === 'Manual') {
+            // No live stats for manual rigs
+            liveStats = {};
+          }
+          // Merge live stats into rig document
+          await rigDoc.ref.set({ ...rig, ...liveStats, lastUpdated: Date.now() }, { merge: true });
+        } catch (err) {
+          // Improved error logging
+          console.error(`Failed to fetch stats for rig ${rigDoc.id} (platform: ${rig.platform}, user: ${uid}):`, err);
+          // Optionally, you could write an error field to the rig doc for UI display
+          await rigDoc.ref.set({ ...rig, fetchError: String(err), lastUpdated: Date.now() }, { merge: true });
+        }
+      }
+    }
+    // In the scheduled handler, for each user/rig with platform 'HiveOS':
+    for (const key of userList.keys) {
+      const uid = key.name;
+      const fs = await getFirestore();
+      // Fetch all rigs for this user from Firestore
+      const rigDocs = await fs.collection('users').doc(uid).collection('rigs').get();
+      for (const rigDoc of rigDocs.docs) {
+        const rig = rigDoc.data();
+        if (rig.platform === 'HiveOS' && rig.hiveosToken && rig.hiveosFarmId) {
+          try {
+            // Fetch all workers for the user's farm
+            const url = `https://api2.hiveos.farm/api/v2/farms/${rig.hiveosFarmId}/workers`;
+            const resp = await fetch(url, {
+              headers: {
+                'Authorization': `Bearer ${rig.hiveosToken}`,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+              },
+            });
+            if (!resp.ok) throw new Error('Failed to fetch HiveOS workers');
+            const rigsData = await resp.json();
+            const workers = (rigsData as any).data;
+            if (workers && Array.isArray(workers)) {
+              for (const worker of workers) {
+                // Save each worker's stats to Firestore under /users/{uid}/rigs/{worker.id}
+                await fs.collection('users').doc(uid).collection('rigs').doc(worker.id?.toString() || worker.name).set({
+                  id: worker.id?.toString() || worker.name,
+                  name: worker.name,
+                  status: worker.stats?.online ? 'online' : 'offline',
+                  hashrate: worker.hashrate || 0,
+                  hashrateUnit: 'MH/s',
+                  powerConsumption: worker.power || 0,
+                  temperature: worker.gpu_stats?.length ? Math.max(...worker.gpu_stats.map((g: any) => g.temp)) : null,
+                  fanSpeed: worker.gpu_stats?.length ? Math.max(...worker.gpu_stats.map((g: any) => g.fan)) : null,
+                  uptime: worker.stats?.uptime || 0,
+                  algorithm: worker.algo || '',
+                  pool: worker.pool || '',
+                  lastSeen: worker.stats?.updated || Date.now(),
+                  gpuDetails: Array.isArray(worker.gpu_stats) ? worker.gpu_stats.map((g: any, idx: number) => ({
+                    id: `gpu${idx}`,
+                    name: g.name || `GPU ${idx+1}`,
+                    temperature: g.temp,
+                    fanSpeed: g.fan,
+                    hashrate: g.hash,
+                    power: g.power,
+                  })) : [],
+                  lastUpdated: Date.now(),
+                  platform: 'HiveOS',
+                  hiveosFarmId: rig.hiveosFarmId,
+                  hiveosToken: rig.hiveosToken,
+                }, { merge: true });
+              }
+            }
+          } catch (err) {
+            console.error(`Failed to fetch HiveOS stats for user ${uid}, farm ${rig.hiveosFarmId}:`, err);
+          }
+        }
       }
     }
   }
 } satisfies ExportedHandler<Env>;
+// NOTE: You must bundle firebase-admin with your Worker for this to work in production.

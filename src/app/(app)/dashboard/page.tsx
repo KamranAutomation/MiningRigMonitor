@@ -9,54 +9,50 @@ import React, { useEffect, useState } from 'react';
 import { Home, PlusCircle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import Link from 'next/link';
-import type { Rig } from '@/types';
+import { Timestamp, collection as fsCollection, getDocs, orderBy, limit, query } from 'firebase/firestore';
+import { db } from '@/lib/firebase/config';
+import { useAuth } from '@/components/auth/auth-provider';
 
-function getCurrentUserUid() {
-	// TODO: Replace with actual auth logic to get current user's UID
-	// For now, try to get from localStorage or a global auth context
-	if (typeof window !== 'undefined') {
-		return localStorage.getItem('uid');
-	}
-	return null;
+async function fetchUserRigs(uid: string) {
+	const querySnapshot = await getDocs(fsCollection(db, `users/${uid}/rigs`));
+	return querySnapshot.docs.map(doc => ({ id: doc.id, ...(doc.data() as object) }));
 }
 
 export default function DashboardPage() {
-	const [rigs, setRigs] = useState<Rig[]>([]);
+	const { user } = useAuth();
+	const [rigs, setRigs] = useState<any[]>([]);
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string | null>(null);
-	const [earnings, setEarnings] = useState<{ total: string; lastPayout: string; lastPayoutDate: string } | null>(null);
+	const [payouts, setPayouts] = useState<any[]>([]);
+	const uid = user?.uid;
 
 	useEffect(() => {
-		async function fetchRigs() {
-			setLoading(true);
-			setError(null);
-			try {
-				const uid = getCurrentUserUid();
-				if (!uid) {
-					setError('User not authenticated.');
-					setLoading(false);
-					return;
-				}
-				const res = await fetch(`/api/rigs?uid=${uid}`);
-				if (!res.ok) throw new Error('Failed to fetch rig data');
-				const data = await res.json();
-				setRigs(Array.isArray(data) ? data : []);
-				// Optionally fetch earnings from another endpoint or calculate from rigs
-				// setEarnings(...)
-			} catch (e: any) {
-				setError(e.message || 'Unknown error');
-			} finally {
-				setLoading(false);
-			}
-		}
-		fetchRigs();
-	}, []);
+		if (!uid) return;
+		setLoading(true);
+		fetchUserRigs(uid)
+			.then(setRigs)
+			.catch(e => setError(e.message || 'Failed to load rigs'))
+			.finally(() => setLoading(false));
+		// Fetch recent payouts
+		(async () => {
+			const payoutsQuery = query(
+				fsCollection(db, `users/${uid}/payouts`),
+				orderBy('timestamp', 'desc'),
+				limit(5)
+			);
+			const snapshot = await getDocs(payoutsQuery);
+			setPayouts(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+		})();
+	}, [uid]);
 
 	// Calculate stats from live data
 	const totalRigs = rigs.length;
 	const onlineRigs = rigs.filter(rig => rig.status === 'online').length;
-	const totalHashrate = rigs.reduce((sum, rig) => sum + (typeof rig.hashrate === 'number' ? rig.hashrate : 0), 0).toFixed(1) + (rigs[0]?.hashrateUnit ? ` ${rigs[0].hashrateUnit}` : '');
-	const totalPower = (rigs.reduce((sum, rig) => sum + (rig.powerConsumption || 0), 0) / 1000).toFixed(1) + ' kW';
+	const errorRigs = rigs.filter(rig => rig.fetchError).length;
+	const totalHashrate = rigs.length > 0 ?
+		(rigs.reduce((sum, r) => sum + (r.hashrate || 0), 0).toFixed(2) + ' MH/s') : '--';
+	const totalPower = rigs.length > 0 ?
+		((rigs.reduce((sum, r) => sum + (r.powerConsumption || 0), 0) / 1000).toFixed(2) + ' kW') : '--';
 
 	return (
 		<div className="container mx-auto py-2">
@@ -78,6 +74,7 @@ export default function DashboardPage() {
 				onlineRigs={onlineRigs}
 				totalHashrate={totalHashrate}
 				totalPower={totalPower}
+				errorRigs={errorRigs}
 			/>
 
 			<div className="mt-8">
@@ -113,7 +110,7 @@ export default function DashboardPage() {
 						<CardTitle>Total Earnings</CardTitle>
 					</CardHeader>
 					<CardContent>
-						<span className="text-2xl font-bold">{earnings?.total || '--'}</span>
+						<span className="text-2xl font-bold">{'--'}</span>
 					</CardContent>
 				</Card>
 				<Card>
@@ -121,10 +118,55 @@ export default function DashboardPage() {
 						<CardTitle>Last Payout</CardTitle>
 					</CardHeader>
 					<CardContent>
-						<span className="text-2xl font-bold">{earnings?.lastPayout || '--'}</span>
-						<div className="text-muted-foreground text-sm">on {earnings?.lastPayoutDate || '--'}</div>
+						{payouts.length > 0 ? (
+							<>
+								<span className="text-2xl font-bold">{payouts[0].amount} BTC</span>
+								<div className="text-muted-foreground text-sm">
+									{payouts[0].provider} to {payouts[0].address}<br />
+									{payouts[0].timestamp ? new Date(payouts[0].timestamp).toLocaleString() : ''}
+								</div>
+							</>
+						) : (
+							<>
+								<span className="text-2xl font-bold">{'--'}</span>
+								<div className="text-muted-foreground text-sm">{'--'}</div>
+							</>
+						)}
 					</CardContent>
 				</Card>
+			</div>
+
+			{/* Recent payout history */}
+			<div className="mt-8">
+				<h2 className="text-xl font-semibold mb-4 text-foreground">Recent Payouts</h2>
+				{payouts.length === 0 ? (
+					<div className="text-muted-foreground">No payouts yet.</div>
+				) : (
+					<div className="overflow-x-auto">
+						<table className="min-w-full text-sm">
+							<thead>
+								<tr className="text-muted-foreground">
+									<th className="px-2 py-1 text-left">Date</th>
+									<th className="px-2 py-1 text-left">Amount</th>
+									<th className="px-2 py-1 text-left">Provider</th>
+									<th className="px-2 py-1 text-left">Address</th>
+									<th className="px-2 py-1 text-left">Status</th>
+								</tr>
+							</thead>
+							<tbody>
+								{payouts.map((p) => (
+									<tr key={p.id}>
+										<td className="px-2 py-1">{p.timestamp ? new Date(p.timestamp).toLocaleString() : ''}</td>
+										<td className="px-2 py-1">{p.amount} BTC</td>
+										<td className="px-2 py-1">{p.provider}</td>
+										<td className="px-2 py-1 truncate max-w-xs">{p.address}</td>
+										<td className="px-2 py-1">{p.status}</td>
+									</tr>
+								))}
+							</tbody>
+						</table>
+					</div>
+				)}
 			</div>
 		</div>
 	);
