@@ -19,6 +19,9 @@ export interface Env {
   RIGS_KV: KVNamespace;
   NICEHASH_KEY: string;
   NICEHASH_SECRET: string;
+  FIREBASE_PRIVATE_KEY: string;
+  FIREBASE_CLIENT_EMAIL: string;
+  FIREBASE_PROJECT_ID: string;
 }
 
 const TELEGRAM_BOT_TOKEN = "<YOUR_TELEGRAM_BOT_TOKEN>";
@@ -257,55 +260,70 @@ async function getUserPayoutSettingsFromFirestore(uid: string) {
   };
 }
 
-// --- Firestore Admin Setup for Worker ---
-import { initializeApp, applicationDefault } from 'firebase-admin/app';
-import { getFirestore } from 'firebase-admin/firestore';
+// REMOVE: firebase-admin/app, firebase-admin/firestore, and all Node.js Firestore usage
+// ADD: Firestore REST API + JWT authentication for Cloudflare Workers
+import { SignJWT } from 'jose';
 
-let firestore: FirebaseFirestore.Firestore | null = null;
-function getAdminFirestore() {
-  if (!firestore) {
-    initializeApp({ credential: applicationDefault() });
-    firestore = getFirestore();
-  }
-  return firestore;
-}
+async function getAccessToken(env: any) {
+  const privateKey = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n');
+  const clientEmail = env.FIREBASE_CLIENT_EMAIL;
+  const projectId = env.FIREBASE_PROJECT_ID;
 
-// Helper: Get alert settings from Firestore for a user
-async function getUserAlertSettingsFromFirestore(uid: string) {
-  const fs = getAdminFirestore();
-  const doc = await fs.collection('users').doc(uid).collection('settings').doc('alerts').get();
-  const data = doc.exists ? doc.data() : {};
-  return {
-    enabled: data?.enabled !== false, // default true
-    chatId: data?.telegramChatId || TELEGRAM_CHAT_ID,
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = iat + 3600;
+
+  const payload = {
+    iss: clientEmail,
+    sub: clientEmail,
+    aud: 'https://oauth2.googleapis.com/token',
+    iat,
+    exp,
+    scope: 'https://www.googleapis.com/auth/datastore',
   };
-}
 
-async function sendUserTelegramAlertWithFirestore(uid: string, message: string) {
-  const settings = await getUserAlertSettingsFromFirestore(uid);
-  if (!settings.enabled) return;
-  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: settings.chatId, text: message })
+  // jose expects a CryptoKey, so we use subtle.importKey
+  const key = await crypto.subtle.importKey(
+    'pkcs8',
+    new TextEncoder().encode(privateKey),
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+
+  const jwt = await new SignJWT(payload)
+    .setProtectedHeader({ alg: 'RS256', typ: 'JWT' })
+    .sign(key);
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: jwt,
+    }),
   });
-}
 
-// Ethermine API: Fetch rig stats by wallet address
-async function fetchEthermineRigStats(wallet: string) {
-  // Ethermine API docs: https://ethermine.org/api/doc
-  const url = `https://api.ethermine.org/miner/${wallet}/currentStats`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error('Failed to fetch Ethermine data');
-  const data = await resp.json() as any;
-  if (data.status !== 'OK') throw new Error('Ethermine API error: ' + data.message);
-  return data.data;
+  const data = await res.json();
+  return data.access_token;
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: any): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname === "/api/firestore-doc") {
+      // Example: fetch a Firestore document using REST API
+      const accessToken = await getAccessToken(env);
+      const projectId = env.FIREBASE_PROJECT_ID;
+      const documentPath = 'users/YOUR_USER_ID/rigs/rig1'; // Change as needed or get from query
+      const apiUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${documentPath}`;
+      const firestoreRes = await fetch(apiUrl, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      });
+      const data = await firestoreRes.json();
+      return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json' } });
+    }
     if (url.pathname === "/api/nicehash-public") {
       try {
         const stats = await fetchNiceHashPublicData();
