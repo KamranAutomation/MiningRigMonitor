@@ -248,116 +248,313 @@ async function triggerCoinbasePayout(apiKey: string, payoutAddress: string, amou
   throw new Error('Coinbase payout: unexpected response');
 }
 
-// Helper: Get payout provider and API key from Firestore
-async function getUserPayoutSettingsFromFirestore(uid: string) {
-  const fs = getAdminFirestore();
-  const doc = await fs.collection('users').doc(uid).collection('settings').doc('payout').get();
-  const data = doc.exists ? doc.data() : {};
-  return {
-    provider: data?.provider || 'nowpayments', // 'nowpayments' or 'coinbase'
-    apiKey: data?.apiKey || '',
-    payoutAddress: data?.payoutAddress || '',
-  };
+// --- Firestore REST API helpers ---
+async function firestoreGetDoc(env: Env, documentPath: string): Promise<any> {
+  const accessToken = await getAccessToken(env);
+  const projectId = env.FIREBASE_PROJECT_ID;
+  const apiUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${documentPath}`;
+  const res = await fetch(apiUrl, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!res.ok) throw new Error(`Firestore GET failed: ${res.status}`);
+  return await res.json();
 }
 
-// REMOVE: firebase-admin/app, firebase-admin/firestore, and all Node.js Firestore usage
-// ADD: Firestore REST API + JWT authentication for Cloudflare Workers
-import { SignJWT } from 'jose';
-
-async function getAccessToken(env: any) {
-  const privateKey = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n');
-  const clientEmail = env.FIREBASE_CLIENT_EMAIL;
+async function firestoreSetDoc(env: Env, documentPath: string, data: any): Promise<any> {
+  const accessToken = await getAccessToken(env);
   const projectId = env.FIREBASE_PROJECT_ID;
+  const apiUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${documentPath}`;
+  const body = JSON.stringify({ fields: firestoreEncodeFields(data) });
+  const res = await fetch(apiUrl, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body,
+  });
+  if (!res.ok) throw new Error(`Firestore SET failed: ${res.status}`);
+  return await res.json();
+}
 
-  const iat = Math.floor(Date.now() / 1000);
-  const exp = iat + 3600;
+async function firestoreAddDoc(env: Env, collectionPath: string, data: any): Promise<any> {
+  const accessToken = await getAccessToken(env);
+  const projectId = env.FIREBASE_PROJECT_ID;
+  const apiUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${collectionPath}`;
+  const body = JSON.stringify({ fields: firestoreEncodeFields(data) });
+  const res = await fetch(apiUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body,
+  });
+  if (!res.ok) throw new Error(`Firestore ADD failed: ${res.status}`);
+  return await res.json();
+}
 
+function firestoreEncodeFields(data: any): any {
+  // Encodes JS object to Firestore REST API fields format
+  const encode = (val: any): any => {
+    if (val === null) return { nullValue: null };
+    if (typeof val === 'boolean') return { booleanValue: val };
+    if (typeof val === 'number') return { doubleValue: val };
+    if (typeof val === 'string') return { stringValue: val };
+    if (Array.isArray(val)) return { arrayValue: { values: val.map(encode) } };
+    if (typeof val === 'object') {
+      const fields: any = {};
+      for (const k in val) fields[k] = encode(val[k]);
+      return { mapValue: { fields } };
+    }
+    return { stringValue: String(val) };
+  };
+  const fields: any = {};
+  for (const k in data) fields[k] = encode(data[k]);
+  return fields;
+}
+
+function firestoreDecodeFields(fields: any): any {
+  // Decodes Firestore REST API fields format to JS object
+  const decode = (val: any): any => {
+    if ('nullValue' in val) return null;
+    if ('booleanValue' in val) return val.booleanValue;
+    if ('doubleValue' in val) return val.doubleValue;
+    if ('integerValue' in val) return Number(val.integerValue);
+    if ('stringValue' in val) return val.stringValue;
+    if ('arrayValue' in val) return (val.arrayValue.values || []).map(decode);
+    if ('mapValue' in val) {
+      const obj: any = {};
+      for (const k in val.mapValue.fields) obj[k] = decode(val.mapValue.fields[k]);
+      return obj;
+    }
+    return undefined;
+  };
+  const obj: any = {};
+  for (const k in fields) obj[k] = decode(fields[k]);
+  return obj;
+}
+
+// --- Google Service Account JWT for Firestore REST API ---
+async function getAccessToken(env: Env): Promise<string> {
+  // Use Google Service Account credentials from env
+  const privateKey = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n");
+  const clientEmail = env.FIREBASE_CLIENT_EMAIL;
+  const now = Math.floor(Date.now() / 1000);
+  const header = {
+    alg: "RS256",
+    typ: "JWT"
+  };
   const payload = {
     iss: clientEmail,
     sub: clientEmail,
-    aud: 'https://oauth2.googleapis.com/token',
-    iat,
-    exp,
-    scope: 'https://www.googleapis.com/auth/datastore',
+    aud: "https://oauth2.googleapis.com/token",
+    scope: "https://www.googleapis.com/auth/datastore",
+    iat: now,
+    exp: now + 3600
   };
-
-  // jose expects a CryptoKey, so we use subtle.importKey
+  // Encode header and payload
+  function base64url(input: string) {
+    return btoa(input)
+      .replace(/=/g, "")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_");
+  }
+  const enc = new TextEncoder();
+  const headerB64 = base64url(JSON.stringify(header));
+  const payloadB64 = base64url(JSON.stringify(payload));
+  const toSign = `${headerB64}.${payloadB64}`;
+  // Import private key
   const key = await crypto.subtle.importKey(
-    'pkcs8',
-    new TextEncoder().encode(privateKey),
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    "pkcs8",
+    str2ab(privateKey),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false,
-    ['sign']
+    ["sign"]
   );
-
-  const jwt = await new SignJWT(payload)
-    .setProtectedHeader({ alg: 'RS256', typ: 'JWT' })
-    .sign(key);
-
-  const res = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion: jwt,
-    }),
+  // Sign
+  const sig = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    enc.encode(toSign)
+  );
+  function ab2b64url(buf: ArrayBuffer) {
+    let bin = '';
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  }
+  const jwt = `${toSign}.${ab2b64url(sig)}`;
+  // Exchange JWT for access token
+  const tokenResp = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
   });
-
-  const data = await res.json();
-  return data.access_token;
+  if (!tokenResp.ok) throw new Error("Failed to get Google access token");
+  const tokenData = await tokenResp.json() as { access_token: string };
+  return tokenData.access_token;
 }
 
-export default {
-  async fetch(request: Request, env: any): Promise<Response> {
-    const url = new URL(request.url);
-    if (url.pathname === "/api/firestore-doc") {
-      // Example: fetch a Firestore document using REST API
-      const accessToken = await getAccessToken(env);
-      const projectId = env.FIREBASE_PROJECT_ID;
-      const documentPath = 'users/YOUR_USER_ID/rigs/rig1'; // Change as needed or get from query
-      const apiUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/${documentPath}`;
-      const firestoreRes = await fetch(apiUrl, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-      });
-      const data = await firestoreRes.json();
-      return new Response(JSON.stringify(data), { headers: { 'Content-Type': 'application/json' } });
-    }
-    if (url.pathname === "/api/nicehash-public") {
-      try {
-        const stats = await fetchNiceHashPublicData();
-        return new Response(JSON.stringify(stats), { status: 200, headers: { 'Content-Type': 'application/json' } });
-      } catch (e) {
-        return new Response('Failed to fetch public NiceHash data', { status: 500 });
-      }
-    }
-    if (url.pathname === "/api/rigs") {
-      if (request.method === "GET") {
-        const uid = url.searchParams.get("uid");
-        if (!uid) return new Response("Missing uid", { status: 400 });
-        const data = await env.RIGS_KV.get(uid);
-        return new Response(data || "[]", { status: 200, headers: { 'Content-Type': 'application/json' } });
-      }
-      if (request.method === "POST") {
-        const body = await request.json();
-        // Type assertion to help TypeScript
-        const { uid, rigData } = body as { uid?: string; rigData?: any };
-        if (!uid || !rigData) return new Response("Missing uid or rigData", { status: 400 });
-        await env.RIGS_KV.put(uid, JSON.stringify(rigData));
-        return new Response("OK", { status: 200 });
-      }
-      return new Response("Method Not Allowed", { status: 405 });
-    }
-    if (url.pathname === "/api/ping") {
-      return new Response("Hello Miner", { status: 200 });
-    }
-    return new Response("Not found", { status: 404 });
-  },
+function str2ab(str: string): ArrayBuffer {
+  // Convert PEM to ArrayBuffer
+  const b64 = str.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+  const bin = atob(b64);
+  const buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
 
-  // The scheduled handler is invoked at the interval set in our wrangler.jsonc's
-  // [[triggers]] configuration.
-  async scheduled(event, env, ctx) {
+// --- Refactored Firestore logic ---
+async function getUserPayoutSettingsFromFirestore(uid: string, env: Env) {
+  try {
+    const doc = await firestoreGetDoc(env, `users/${uid}/settings/payout`);
+    const data = doc.fields ? firestoreDecodeFields(doc.fields) : {};
+    return {
+      provider: data.provider || 'nowpayments',
+      apiKey: data.apiKey || '',
+      payoutAddress: data.payoutAddress || '',
+    };
+  } catch {
+    return { provider: 'nowpayments', apiKey: '', payoutAddress: '' };
+  }
+}
+
+async function sendUserTelegramAlertWithFirestore(uid: string, message: string, env: Env) {
+  // Optionally, fetch user-specific Telegram chat ID from Firestore
+  let chatId = TELEGRAM_CHAT_ID;
+  try {
+    const doc = await firestoreGetDoc(env, `users/${uid}/settings/telegram`);
+    const data = doc.fields ? firestoreDecodeFields(doc.fields) : {};
+    if (data.chatId) chatId = data.chatId;
+  } catch {}
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text: message })
+  });
+}
+
+// --- SCHEDULED HANDLER: Replace all Firestore SDK usage with REST API helpers ---
+const handler: ExportedHandler<Env> = {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    let response: Response;
+    // --- AUTH CHECK ---
+    const auth = requireAuth(request);
+    if (!auth && path.startsWith('/api/')) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+    const uid = auth?.uid || '';
+    try {
+      // --- ALERTS ENDPOINT ---
+      if (path === '/api/alerts' && request.method === 'GET') {
+        // List alerts for user
+        const doc = await firestoreGetDoc(env, `users/${uid}/settings/alerts`);
+        const data = doc.fields ? firestoreDecodeFields(doc.fields) : {};
+        return Response.json({ alerts: data.alerts || [] });
+      }
+      if (path === '/api/alerts' && request.method === 'POST') {
+        // Add alert for user
+        const body = await request.json();
+        const doc = await firestoreGetDoc(env, `users/${uid}/settings/alerts`);
+        const data = doc.fields ? firestoreDecodeFields(doc.fields) : {};
+        const alerts = Array.isArray(data.alerts) ? data.alerts : [];
+        alerts.push(body);
+        await firestoreSetDoc(env, `users/${uid}/settings/alerts`, { alerts });
+        return Response.json({ success: true });
+      }
+      // --- HISTORY ENDPOINT ---
+      if (path === '/api/history' && request.method === 'GET') {
+        // List payout history for user
+        const accessToken = await getAccessToken(env);
+        const projectId = env.FIREBASE_PROJECT_ID;
+        const payoutsUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${uid}/payouts`;
+        const res = await fetch(payoutsUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
+        const data = await res.json();
+        const docsArr = (data && typeof data === 'object' && 'documents' in data && Array.isArray((data as any).documents)) ? (data as any).documents : [];
+        const payouts = docsArr.map((doc: any) => firestoreDecodeFields(doc.fields));
+        return Response.json({ payouts });
+      }
+      // --- SETTINGS ENDPOINT ---
+      if (path === '/api/settings' && request.method === 'GET') {
+        // Get user settings
+        const doc = await firestoreGetDoc(env, `users/${uid}/settings/payout`);
+        const data = doc.fields ? firestoreDecodeFields(doc.fields) : {};
+        return Response.json({ settings: data });
+      }
+      if (path === '/api/settings' && request.method === 'POST') {
+        // Update user settings
+        const body = await request.json();
+        await firestoreSetDoc(env, `users/${uid}/settings/payout`, body);
+        return Response.json({ success: true });
+      }
+      // --- RIGS ENDPOINT ---
+      if (path === '/api/rigs' && request.method === 'GET') {
+        // List all rigs for user
+        const accessToken = await getAccessToken(env);
+        const projectId = env.FIREBASE_PROJECT_ID;
+        const rigsUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${uid}/rigs`;
+        const res = await fetch(rigsUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
+        const data = await res.json();
+        const docsArr = (data && typeof data === 'object' && 'documents' in data && Array.isArray((data as any).documents)) ? (data as any).documents : [];
+        const rigs = docsArr.map((doc: any) => firestoreDecodeFields(doc.fields));
+        return Response.json({ rigs });
+      }
+      // --- RIG DELETE ENDPOINT ---
+      if (path.startsWith('/api/rigs/') && request.method === 'DELETE') {
+        try {
+          const id = path.split('/').pop();
+          if (!id) return Response.json({ error: 'Missing rig id' }, { status: 400 });
+          // Delete rig doc from Firestore
+          const accessToken = await getAccessToken(env);
+          const projectId = env.FIREBASE_PROJECT_ID;
+          const rigDocUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${uid}/rigs/${id}`;
+          const res = await fetch(rigDocUrl, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          if (!res.ok && res.status !== 404) {
+            let errText = '';
+            try {
+              errText = await res.text();
+            } catch {}
+            return Response.json({ error: 'Failed to delete rig: ' + errText }, { status: 500 });
+          }
+          // Add rig id to deletedRigs in Firestore
+          try {
+            const deletedRigsDoc = await firestoreGetDoc(env, `users/${uid}/settings/deletedRigs`);
+            let deletedRigs: string[] = [];
+            if (deletedRigsDoc && deletedRigsDoc.fields && deletedRigsDoc.fields.ids && Array.isArray(deletedRigsDoc.fields.ids.arrayValue?.values)) {
+              deletedRigs = deletedRigsDoc.fields.ids.arrayValue.values.map((v: any) => v.stringValue);
+            }
+            if (!deletedRigs.includes(id)) {
+              deletedRigs.push(id);
+              await firestoreSetDoc(env, `users/${uid}/settings/deletedRigs`, { ids: deletedRigs });
+            }
+          } catch {}
+          return Response.json({ success: true });
+        } catch (err) {
+          return Response.json({ error: err && typeof err === 'object' && 'message' in err ? (err as any).message : String(err) || 'Unknown error during rig deletion' }, { status: 500 });
+        }
+      }
+      // --- DEFAULT: 404 ---
+      return Response.json({ error: 'Not found' }, { status: 404 });
+    } catch (err) {
+      // Robust error handling
+      let msg = 'Unknown error';
+      if (typeof err === 'object' && err && 'message' in err) {
+        msg = (err as any).message;
+      } else if (typeof err === 'string') {
+        msg = err;
+      }
+      // Optionally log error to a logging service here
+      return Response.json({ error: msg }, { status: 500 });
+    }
+  },
+  scheduled: async (controller: ScheduledController, env: Env, ctx: ExecutionContext) => {
     // Only declare userList once
     const userList = await env.RIGS_KV.list();
     // Example: For each user, fetch NiceHash data and store in KV
@@ -397,7 +594,7 @@ export default {
           const lastSeen = new Date(rig.lastSeen).getTime();
           const now = Date.now();
           if (now - lastSeen > 10 * 60 * 1000) { // 10 minutes
-            await sendUserTelegramAlertWithFirestore(uid, `ALERT: Rig ${rig.name} (user ${uid}) has been offline for more than 10 minutes!`);
+            await sendUserTelegramAlertWithFirestore(uid, `ALERT: Rig ${rig.name} (user ${uid}) has been offline for more than 10 minutes!`, env);
           }
         }
       }
@@ -408,7 +605,7 @@ export default {
       // Fetch payout threshold and withdrawal address for user
       const thresholdStr = await env.RIGS_KV.get(`payout_threshold:${uid}`);
       // Get payout provider, API key, and address from Firestore
-      const payoutSettings = await getUserPayoutSettingsFromFirestore(uid);
+      const payoutSettings = await getUserPayoutSettingsFromFirestore(uid, env);
       const withdrawalAddress = payoutSettings.payoutAddress;
       if (!thresholdStr || !withdrawalAddress) continue;
       const threshold = parseFloat(thresholdStr);
@@ -428,9 +625,8 @@ export default {
           }
           if (payoutResult) {
             // Add payout history to Firestore
-            const fs = getAdminFirestore();
             const payoutId = `${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
-            await fs.collection('users').doc(uid).collection('payouts').doc(payoutId).set({
+            await firestoreSetDoc(env, `users/${uid}/payouts/${payoutId}`, {
               timestamp: Date.now(),
               amount: earnings,
               address: withdrawalAddress,
@@ -438,7 +634,7 @@ export default {
               status: 'success',
               tx: payoutResult,
             });
-            await sendUserTelegramAlertWithFirestore(uid, `Auto payout triggered for user ${uid}: ${earnings} BTC sent to ${withdrawalAddress} via ${payoutSettings.provider}`);
+            await sendUserTelegramAlertWithFirestore(uid, `Auto payout triggered for user ${uid}: ${earnings} BTC sent to ${withdrawalAddress} via ${payoutSettings.provider}`, env);
           }
         }
       } catch (e) {
@@ -448,12 +644,20 @@ export default {
         } else if (typeof e === 'string') {
           msg = e;
         }
-        await sendUserTelegramAlertWithFirestore(uid, `Auto payout error for user ${uid}: ${msg}`);
+        await sendUserTelegramAlertWithFirestore(uid, `Auto payout error for user ${uid}: ${msg}`, env);
       }
     }
     // Firestore sync logic
     for (const key of userList.keys) {
       const uid = key.name;
+      // Fetch deletedRigs list from Firestore
+      let deletedRigs: string[] = [];
+      try {
+        const deletedRigsDoc = await firestoreGetDoc(env, `users/${uid}/settings/deletedRigs`);
+        if (deletedRigsDoc && deletedRigsDoc.fields && deletedRigsDoc.fields.ids && Array.isArray(deletedRigsDoc.fields.ids.arrayValue?.values)) {
+          deletedRigs = deletedRigsDoc.fields.ids.arrayValue.values.map((v: any) => v.stringValue);
+        }
+      } catch {}
       // Fetch tokens/IDs from KV
       const hiveToken = await env.RIGS_KV.get(`hiveos_token:${uid}`);
       const farmId = await env.RIGS_KV.get(`hiveos_farmid:${uid}`);
@@ -488,20 +692,45 @@ export default {
         } catch {}
       }
       // Save to Firestore: /users/{uid}/rigs/{rigId}
-      const fs = await getFirestore();
-      for (const rig of allRigs) {
-        if (!rig.id) continue;
-        await fs.collection('users').doc(uid).collection('rigs').doc(rig.id).set(rig, { merge: true });
+      // Defensive: ensure deletedRigs is an array of strings and lowercase for comparison
+      deletedRigs = Array.isArray(deletedRigs) ? deletedRigs.map(r => String(r).toLowerCase()) : [];
+      // Filter out deleted rigs from allRigs before saving
+      const filteredRigs = allRigs.filter(rig => {
+        const rigId = (typeof rig.id === 'string' ? rig.id : String(rig.id || '')).toLowerCase();
+        return rigId && !deletedRigs.includes(rigId);
+      });
+      // Save filtered rigs to Firestore: /users/{uid}/rigs/{rigId}
+      for (const rig of filteredRigs) {
+        const rigId = (typeof rig.id === 'string' ? rig.id : String(rig.id || ''));
+        if (!rigId) continue;
+        await firestoreSetDoc(env, `users/${uid}/rigs/${rigId}`, rig);
+      }
+      // Save filtered rigs to KV as well
+      await env.RIGS_KV.put(uid, JSON.stringify(filteredRigs));
+      // Failsafe: Remove any deleted rigs that may exist in Firestore
+      const accessToken = await getAccessToken(env);
+      const projectId = env.FIREBASE_PROJECT_ID;
+      for (const deletedId of deletedRigs) {
+        const rigDocUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${uid}/rigs/${deletedId}`;
+        await fetch(rigDocUrl, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
       }
     }
     // Fetch rig live stats based on platform
-    const fs = await getFirestore();
     for (const key of userList.keys) {
       const uid = key.name;
       // Fetch all rigs for this user from Firestore
-      const rigDocs = await fs.collection('users').doc(uid).collection('rigs').get();
-      for (const rigDoc of rigDocs.docs) {
-        const rig = rigDoc.data();
+      // List all rig docs under /users/{uid}/rigs
+      const accessToken = await getAccessToken(env);
+      const projectId = env.FIREBASE_PROJECT_ID;
+      const rigsApiUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${uid}/rigs`;
+      const rigDocsRes = await fetch(rigsApiUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
+      const rigDocs = await rigDocsRes.json();
+      if (!rigDocs || typeof rigDocs !== 'object' || !('documents' in rigDocs) || !Array.isArray(rigDocs.documents)) continue;
+      for (const rigDoc of rigDocs.documents) {
+        const rig = rigDoc.fields ? firestoreDecodeFields(rigDoc.fields) : {};
         let liveStats = {};
         try {
           if (rig.platform === 'NiceHash' && rig.nicehashApiKey && rig.nicehashApiSecret && rig.nicehashOrgId) {
@@ -514,27 +743,29 @@ export default {
             const stats = await fetchEthermineRigStats(rig.ethermineWallet);
             liveStats = stats || {};
           } else if (rig.platform === 'Manual') {
-            // No live stats for manual rigs
             liveStats = {};
           }
           // Merge live stats into rig document
-          await rigDoc.ref.set({ ...rig, ...liveStats, lastUpdated: Date.now() }, { merge: true });
+          await firestoreSetDoc(env, `users/${uid}/rigs/${rig.id}`, { ...rig, ...liveStats, lastUpdated: Date.now() });
         } catch (err) {
           // Improved error logging
-          console.error(`Failed to fetch stats for rig ${rigDoc.id} (platform: ${rig.platform}, user: ${uid}):`, err);
           // Optionally, you could write an error field to the rig doc for UI display
-          await rigDoc.ref.set({ ...rig, fetchError: String(err), lastUpdated: Date.now() }, { merge: true });
+          await firestoreSetDoc(env, `users/${uid}/rigs/${rig.id}`, { ...rig, fetchError: String(err), lastUpdated: Date.now() });
         }
       }
     }
     // In the scheduled handler, for each user/rig with platform 'HiveOS':
     for (const key of userList.keys) {
       const uid = key.name;
-      const fs = await getFirestore();
       // Fetch all rigs for this user from Firestore
-      const rigDocs = await fs.collection('users').doc(uid).collection('rigs').get();
-      for (const rigDoc of rigDocs.docs) {
-        const rig = rigDoc.data();
+      const accessToken = await getAccessToken(env);
+      const projectId = env.FIREBASE_PROJECT_ID;
+      const rigsApiUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/users/${uid}/rigs`;
+      const rigDocsRes = await fetch(rigsApiUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
+      const rigDocs = await rigDocsRes.json();
+      if (!rigDocs || typeof rigDocs !== 'object' || !('documents' in rigDocs) || !Array.isArray(rigDocs.documents)) continue;
+      for (const rigDoc of rigDocs.documents) {
+        const rig = rigDoc.fields ? firestoreDecodeFields(rigDoc.fields) : {};
         if (rig.platform === 'HiveOS' && rig.hiveosToken && rig.hiveosFarmId) {
           try {
             // Fetch all workers for the user's farm
@@ -552,7 +783,7 @@ export default {
             if (workers && Array.isArray(workers)) {
               for (const worker of workers) {
                 // Save each worker's stats to Firestore under /users/{uid}/rigs/{worker.id}
-                await fs.collection('users').doc(uid).collection('rigs').doc(worker.id?.toString() || worker.name).set({
+                await firestoreSetDoc(env, `users/${uid}/rigs/${worker.id?.toString() || worker.name}`, {
                   id: worker.id?.toString() || worker.name,
                   name: worker.name,
                   status: worker.stats?.online ? 'online' : 'offline',
@@ -577,15 +808,46 @@ export default {
                   platform: 'HiveOS',
                   hiveosFarmId: rig.hiveosFarmId,
                   hiveosToken: rig.hiveosToken,
-                }, { merge: true });
+                });
               }
             }
           } catch (err) {
-            console.error(`Failed to fetch HiveOS stats for user ${uid}, farm ${rig.hiveosFarmId}:`, err);
+            // Optionally log error
           }
         }
       }
     }
   }
-} satisfies ExportedHandler<Env>;
-// NOTE: You must bundle firebase-admin with your Worker for this to work in production.
+};
+
+export default handler;
+
+// --- AUTH MIDDLEWARE PLACEHOLDER ---
+function requireAuth(request: Request): { uid: string } | null {
+  // TODO: Implement real authentication (e.g., JWT, API key, session cookie)
+  // For now, allow all requests (INSECURE!)
+  // Example: extract uid from header or query param
+  const url = new URL(request.url);
+  const uid = url.searchParams.get('uid') || request.headers.get('x-user-uid') || '';
+  if (!uid) return null;
+  return { uid };
+}
+
+// Fetch rig stats from Ethermine public API
+async function fetchEthermineRigStats(wallet: string) {
+  // Ethermine API docs: https://ethermine.org/api/docs/
+  // API endpoint: https://api.ethermine.org/miner/:wallet/dashboard
+  const url = `https://api.ethermine.org/miner/${wallet}/dashboard`;
+  const resp = await fetch(url, {
+    headers: {
+      'Accept': 'application/json',
+    },
+  });
+  const data: any = await resp.json();
+  if (!data || typeof data !== 'object' || data.status !== 'OK' || !data.data) return {};
+  // Return the workers array for compatibility with existing usage
+  return {
+    workers: Array.isArray(data.data.workers) ? data.data.workers : [],
+    currentStatistics: data.data.currentStatistics || {},
+  };
+}

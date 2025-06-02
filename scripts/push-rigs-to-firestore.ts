@@ -40,8 +40,23 @@ const rigs = [
   },
 ];
 
+async function getDeletedRigIds(uid: string): Promise<string[]> {
+  const docRef = db.collection('users').doc(uid).collection('settings').doc('deletedRigs');
+  const docSnap = await docRef.get();
+  const data = docSnap.exists ? docSnap.data() : undefined;
+  if (data && Array.isArray(data.ids)) {
+    return data.ids.map((id: string) => id.toLowerCase());
+  }
+  return [];
+}
+
 async function pushRigs() {
+  const deletedIds = await getDeletedRigIds(uid);
   for (const rig of rigs) {
+    if (deletedIds.includes(rig.id.toLowerCase())) {
+      console.log(`Skipping deleted rig ${rig.id}`);
+      continue;
+    }
     await db.collection('users').doc(uid).collection('rigs').doc(rig.id).set(rig, { merge: true });
     console.log(`Pushed rig ${rig.id} to Firestore for user ${uid}`);
   }

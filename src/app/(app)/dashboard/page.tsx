@@ -12,10 +12,21 @@ import Link from 'next/link';
 import { Timestamp, collection as fsCollection, getDocs, orderBy, limit, query } from 'firebase/firestore';
 import { db } from '@/lib/firebase/config';
 import { useAuth } from '@/components/auth/auth-provider';
+import { useToast } from '@/hooks/use-toast';
 
 async function fetchUserRigs(uid: string) {
+	// Fetch deleted rig IDs
+	const deletedRigsSnap = await getDocs(fsCollection(db, `users/${uid}/settings`));
+	let deletedIds: string[] = [];
+	deletedRigsSnap.forEach(doc => {
+		if (doc.id === 'deletedRigs' && Array.isArray(doc.data().ids)) {
+			deletedIds = doc.data().ids.map((id: string) => id.toLowerCase());
+		}
+	});
 	const querySnapshot = await getDocs(fsCollection(db, `users/${uid}/rigs`));
-	return querySnapshot.docs.map(doc => ({ id: doc.id, ...(doc.data() as object) }));
+	return querySnapshot.docs
+		.map(doc => ({ id: doc.id, ...(doc.data() as object) }))
+		.filter(rig => !deletedIds.includes(rig.id.toLowerCase()));
 }
 
 export default function DashboardPage() {
@@ -24,7 +35,9 @@ export default function DashboardPage() {
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string | null>(null);
 	const [payouts, setPayouts] = useState<any[]>([]);
+	const [deletingId, setDeletingId] = useState<string | null>(null);
 	const uid = user?.uid;
+	const { toast } = useToast();
 
 	useEffect(() => {
 		if (!uid) return;
@@ -53,6 +66,39 @@ export default function DashboardPage() {
 		(rigs.reduce((sum, r) => sum + (r.hashrate || 0), 0).toFixed(2) + ' MH/s') : '--';
 	const totalPower = rigs.length > 0 ?
 		((rigs.reduce((sum, r) => sum + (r.powerConsumption || 0), 0) / 1000).toFixed(2) + ' kW') : '--';
+
+	const handleDeleteRig = async (id: string) => {
+		if (!uid) return;
+		setDeletingId(id);
+		setError(null);
+		// Optimistically remove the rig from UI
+		setRigs(rigs => rigs.filter(r => r.id !== id));
+		try {
+			const res = await fetch(`/api/rigs/${id}?uid=${uid}`, { method: 'DELETE' });
+			let result: { success?: boolean; error?: string } = {};
+			try {
+				result = await res.json();
+			} catch {
+				toast({ title: 'Warning', description: 'Server returned an invalid response, but the rig was removed from your dashboard.', variant: 'destructive' });
+				// Always re-fetch rigs to ensure UI is in sync
+				fetchUserRigs(uid).then(setRigs);
+				return;
+			}
+			if (!res.ok || !result.success) {
+				toast({ title: 'Delete failed', description: result.error || 'Failed to delete rig', variant: 'destructive' });
+			} else {
+				toast({ title: 'Rig deleted', description: 'The rig was deleted successfully.' });
+			}
+			// Always re-fetch rigs to ensure UI is in sync
+			await fetchUserRigs(uid).then(setRigs);
+		} catch (e: any) {
+			toast({ title: 'Delete failed', description: e.message || 'Failed to delete rig', variant: 'destructive' });
+			// Always re-fetch rigs to ensure UI is in sync
+			fetchUserRigs(uid).then(setRigs);
+		} finally {
+			setDeletingId(null);
+		}
+	};
 
 	return (
 		<div className="container mx-auto py-2">
@@ -90,7 +136,7 @@ export default function DashboardPage() {
 				) : rigs.length > 0 ? (
 					<div className="grid grid-cols-1 gap-6 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
 						{rigs.map((rig) => (
-							<RigCard key={rig.id} rig={rig} />
+							<RigCard key={rig.id} rig={rig} onDelete={handleDeleteRig} />
 						))}
 					</div>
 				) : (
