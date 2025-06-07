@@ -5,6 +5,8 @@ import { useAuth } from '@/components/auth/auth-provider';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card } from '@/components/ui/card';
+import { useRouter } from 'next/navigation';
+import { useToast } from '@/hooks/use-toast';
 
 interface ManualRigFormProps {
   rigId?: string; // If editing existing rig
@@ -27,6 +29,8 @@ export const ManualRigForm: React.FC<ManualRigFormProps> = ({ rigId, initialData
   const [notes, setNotes] = useState(initialData.notes || '');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const router = useRouter();
+  const { toast } = useToast();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -44,7 +48,11 @@ export const ManualRigForm: React.FC<ManualRigFormProps> = ({ rigId, initialData
         platform: 'Manual',
         lastUpdated: Date.now(),
       }, { merge: true });
+      toast({ title: 'Rig added', description: 'Your rig is added successfully!' });
       if (onSave) onSave();
+      setTimeout(() => {
+        router.push('/dashboard');
+      }, 500);
     } catch (err: any) {
       setError(err.message || 'Failed to save rig');
     } finally {
